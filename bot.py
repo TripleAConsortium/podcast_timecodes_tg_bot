@@ -82,7 +82,7 @@ def generate_timecodes(transcript: str) -> str:
         f"Транскрипт:\n{transcript}"
     )
     response = deepseek.chat.completions.create(
-        model="deepseek-chat",
+        model="deepseek-reasoner",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
     )
@@ -163,6 +163,52 @@ async def process_audio(client, message, status_message=None):
         os.unlink(tmp_path)
 
 
+async def process_audio_as_caption(client, message):
+    """Download, transcribe, generate timecodes and set as caption on the original message."""
+    suffix = ".ogg"
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        if name.endswith(".m4a"):
+            suffix = ".m4a"
+        elif name.endswith(".mp3"):
+            suffix = ".mp3"
+    elif message.audio:
+        suffix = ".mp3"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        await message.download(file_name=tmp_path)
+        log.info(f"Downloaded to {tmp_path}")
+
+        log.info("Transcribing...")
+        loop = asyncio.get_event_loop()
+        segments = await loop.run_in_executor(None, transcribe, tmp_path)
+        if not segments:
+            await message.reply_text("Не удалось распознать речь.")
+            return
+
+        transcript = build_transcript_with_times(segments)
+        log.info(f"Transcribed {len(segments)} segments")
+
+        log.info("Generating timecodes...")
+        timecodes = generate_timecodes(transcript)
+        log.info("Timecodes generated")
+
+        caption = f"{timecodes}\n\n#подкаст"
+        if len(caption) > 1024:
+            caption = caption[:1020] + "\n..."
+
+        await message.edit_caption(caption)
+        log.info("Caption added to own message")
+
+    except Exception as e:
+        log.error(f"Error: {e}")
+        await message.reply_text(f"Ошибка: {e}")
+    finally:
+        os.unlink(tmp_path)
+
+
 @app.on_message(chat_filter & (filters.voice | filters.audio | (filters.document & filters.create(lambda _, __, m: has_audio(m)))))
 async def handle_new_audio(client, message):
     """Auto-process new audio messages."""
@@ -171,7 +217,12 @@ async def handle_new_audio(client, message):
         return
     processed_ids.add(message.id)
     log.info(f"Received audio from {message.from_user.first_name} in {message.chat.id}")
-    await process_audio(client, message)
+
+    is_own = message.from_user and message.from_user.is_self
+    if is_own:
+        await process_audio_as_caption(client, message)
+    else:
+        await process_audio(client, message)
 
 
 @app.on_message(chat_filter & filters.reply & filters.regex(f"^{TRIGGER_COMMAND}$"))
@@ -187,6 +238,66 @@ async def handle_reply_trigger(client, message):
     # Edit the trigger message into a status, then replace with result.
     status = await message.edit_text("Скачиваю аудио...")
     await process_audio(client, target, status_message=status)
+
+
+CAPTION_COMMAND = os.getenv("CAPTION_COMMAND", "/tc")
+
+
+@app.on_message(chat_filter & filters.reply & filters.regex(f"^{CAPTION_COMMAND}$"))
+async def handle_caption_trigger(client, message):
+    """Process audio and attach timecodes as caption to the original message."""
+    target = message.reply_to_message
+    if not target or not has_audio(target):
+        await message.reply_text("Ответьте этой командой на голосовое или аудио сообщение.")
+        return
+
+    log.info(f"Caption trigger from {message.from_user.first_name} for message {target.id}")
+
+    suffix = ".ogg"
+    if target.document:
+        name = (target.document.file_name or "").lower()
+        if name.endswith(".m4a"):
+            suffix = ".m4a"
+        elif name.endswith(".mp3"):
+            suffix = ".mp3"
+    elif target.audio:
+        suffix = ".mp3"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        await target.download(file_name=tmp_path)
+        log.info(f"Downloaded to {tmp_path}")
+
+        # Delete command message.
+        await message.delete()
+
+        log.info("Transcribing...")
+        loop = asyncio.get_event_loop()
+        segments = await loop.run_in_executor(None, transcribe, tmp_path)
+        if not segments:
+            await target.reply_text("Не удалось распознать речь.")
+            return
+
+        transcript = build_transcript_with_times(segments)
+        log.info(f"Transcribed {len(segments)} segments")
+
+        log.info("Generating timecodes...")
+        timecodes = generate_timecodes(transcript)
+        log.info("Timecodes generated")
+
+        caption = f"{timecodes}\n\n#подкаст"
+        if len(caption) > 1024:
+            caption = caption[:1020] + "\n..."
+
+        await target.edit_caption(caption)
+        log.info("Caption added to original message")
+
+    except Exception as e:
+        log.error(f"Error: {e}")
+        await target.reply_text(f"Ошибка: {e}")
+    finally:
+        os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
