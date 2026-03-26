@@ -1,0 +1,4 @@
+kurigram
+tgcrypto
+python-dotenv
+openai
