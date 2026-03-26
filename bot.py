@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import asyncio
 import os
 import json
 import tempfile
@@ -25,6 +26,7 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 app = Client("podcast_bot", api_id=API_ID, api_hash=API_HASH)
 
 chat_filter = filters.chat(CHAT_ID) if CHAT_ID else filters.all
+processed_ids: set[int] = set()
 
 deepseek = OpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -121,7 +123,8 @@ async def process_audio(client, message, status_message=None):
             await status_message.edit_text("Транскрибирую...")
 
         log.info("Transcribing...")
-        segments = transcribe(tmp_path)
+        loop = asyncio.get_event_loop()
+        segments = await loop.run_in_executor(None, transcribe, tmp_path)
         if not segments:
             text = "Не удалось распознать речь."
             if status_message:
@@ -163,6 +166,10 @@ async def process_audio(client, message, status_message=None):
 @app.on_message(chat_filter & (filters.voice | filters.audio | (filters.document & filters.create(lambda _, __, m: has_audio(m)))))
 async def handle_new_audio(client, message):
     """Auto-process new audio messages."""
+    if message.id in processed_ids:
+        log.info(f"Skipping already processed message {message.id}")
+        return
+    processed_ids.add(message.id)
     log.info(f"Received audio from {message.from_user.first_name} in {message.chat.id}")
     await process_audio(client, message)
 
