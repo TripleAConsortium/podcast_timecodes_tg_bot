@@ -45,9 +45,12 @@ def transcribe(audio_path: str) -> list[dict]:
             "--output_format", "json",
             "--output_dir", tmp,
         ]
-        subprocess.run(cmd, capture_output=True, timeout=3600)
-        json_file = next(Path(tmp).glob("*.json"))
-        with open(json_file) as f:
+        result = subprocess.run(cmd, capture_output=True, timeout=3600)
+        json_files = list(Path(tmp).glob("*.json"))
+        if not json_files:
+            log.error("Whisper produced no output. stderr: %s", result.stderr.decode(errors="replace"))
+            return []
+        with open(json_files[0]) as f:
             data = json.load(f)
     return data.get("segments", [])
 
@@ -225,7 +228,7 @@ async def handle_new_audio(client, message):
         await process_audio(client, message)
 
 
-@app.on_message(chat_filter & filters.reply & filters.regex(f"^{TRIGGER_COMMAND}$"))
+@app.on_message(filters.reply & filters.regex(f"^{TRIGGER_COMMAND}$"))
 async def handle_reply_trigger(client, message):
     """Process old audio when someone replies with /timecodes."""
     target = message.reply_to_message
@@ -243,7 +246,7 @@ async def handle_reply_trigger(client, message):
 CAPTION_COMMAND = os.getenv("CAPTION_COMMAND", "/tc")
 
 
-@app.on_message(chat_filter & filters.reply & filters.regex(f"^{CAPTION_COMMAND}$"))
+@app.on_message(filters.reply & filters.regex(f"^{CAPTION_COMMAND}$"))
 async def handle_caption_trigger(client, message):
     """Process audio and attach timecodes as caption to the original message."""
     target = message.reply_to_message
@@ -251,7 +254,8 @@ async def handle_caption_trigger(client, message):
         await message.reply_text("Ответьте этой командой на голосовое или аудио сообщение.")
         return
 
-    log.info(f"Caption trigger from {message.from_user.first_name} for message {target.id}")
+    sender = message.from_user.first_name if message.from_user else "Unknown"
+    log.info(f"Caption trigger from {sender} for message {target.id}")
 
     suffix = ".ogg"
     if target.document:
