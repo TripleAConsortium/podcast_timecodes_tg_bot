@@ -7,6 +7,7 @@ import subprocess
 import logging
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from openai import OpenAI
@@ -22,6 +23,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 TRIGGER_COMMAND = os.getenv("TRIGGER_COMMAND", "/timecodes")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 app = Client("podcast_bot", api_id=API_ID, api_hash=API_HASH)
 
@@ -32,6 +34,43 @@ deepseek = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com",
 )
+
+
+async def bot_api_reply(chat_id: int, reply_to_message_id: int, text: str) -> bool:
+    """Send a reply via Bot API instead of userbot."""
+    if not BOT_TOKEN:
+        log.warning("BOT_TOKEN not set, cannot send via Bot API")
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "reply_to_message_id": reply_to_message_id,
+        "text": text,
+    }
+    async with httpx.AsyncClient() as http:
+        resp = await http.post(url, json=payload)
+        if resp.status_code == 200:
+            return True
+        log.error(f"Bot API error: {resp.status_code} {resp.text}")
+        return False
+
+
+async def bot_api_edit(chat_id: int, message_id: int, text: str) -> bool:
+    """Edit a message via Bot API."""
+    if not BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+    async with httpx.AsyncClient() as http:
+        resp = await http.post(url, json=payload)
+        if resp.status_code == 200:
+            return True
+        log.error(f"Bot API edit error: {resp.status_code} {resp.text}")
+        return False
 
 
 def transcribe(audio_path: str) -> list[dict]:
@@ -104,7 +143,7 @@ def has_audio(message) -> bool:
     return False
 
 
-async def process_audio(client, message, status_message=None):
+async def process_audio(client, message, status_message=None, use_bot=False):
     """Download, transcribe, and generate timecodes for an audio message."""
     suffix = ".ogg"
     if message.document:
@@ -115,6 +154,16 @@ async def process_audio(client, message, status_message=None):
             suffix = ".mp3"
     elif message.audio:
         suffix = ".mp3"
+
+    chat_id = message.chat.id
+    msg_id = message.id
+
+    # For bot mode, send initial status via Bot API.
+    bot_status_id = None
+    if use_bot and BOT_TOKEN and not status_message:
+        if await bot_api_reply(chat_id, msg_id, "Скачиваю аудио..."):
+            # Get the message id from the last bot message (approximate).
+            bot_status_id = None  # We'll just send a new message with the result.
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
@@ -132,6 +181,9 @@ async def process_audio(client, message, status_message=None):
             text = "Не удалось распознать речь."
             if status_message:
                 await status_message.edit_text(text)
+            elif use_bot and BOT_TOKEN:
+                if not await bot_api_reply(chat_id, msg_id, text):
+                    await message.reply_text(text)
             else:
                 await message.reply_text(text)
             return
@@ -152,6 +204,9 @@ async def process_audio(client, message, status_message=None):
 
         if status_message:
             await status_message.edit_text(reply_text)
+        elif use_bot and BOT_TOKEN:
+            if not await bot_api_reply(chat_id, msg_id, reply_text):
+                await message.reply_text(reply_text)
         else:
             await message.reply_text(reply_text)
 
@@ -160,6 +215,9 @@ async def process_audio(client, message, status_message=None):
         text = f"Ошибка: {e}"
         if status_message:
             await status_message.edit_text(text)
+        elif use_bot and BOT_TOKEN:
+            if not await bot_api_reply(chat_id, msg_id, text):
+                await message.reply_text(text)
         else:
             await message.reply_text(text)
     finally:
@@ -225,7 +283,7 @@ async def handle_new_audio(client, message):
     if is_own:
         await process_audio_as_caption(client, message)
     else:
-        await process_audio(client, message)
+        await process_audio(client, message, use_bot=bool(BOT_TOKEN))
 
 
 @app.on_message(filters.reply & filters.regex(f"^{TRIGGER_COMMAND}$"))
