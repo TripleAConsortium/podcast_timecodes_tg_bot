@@ -74,25 +74,49 @@ async def bot_api_edit(chat_id: int, message_id: int, text: str) -> bool:
         return False
 
 
+WHISPER_CPP_MODEL = os.getenv("WHISPER_CPP_MODEL", os.path.expanduser("~/.local/share/whisper-cpp/ggml-base.bin"))
+
+
 def transcribe(audio_path: str) -> list[dict]:
-    """Run whisper and return segments with timestamps."""
+    """Run whisper-cpp and return segments with timestamps."""
     with tempfile.TemporaryDirectory() as tmp:
+        # whisper-cpp requires WAV input.
+        wav_path = os.path.join(tmp, "audio.wav")
+        conv = subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_path],
+            capture_output=True, timeout=120,
+        )
+        if conv.returncode != 0:
+            log.error("FFmpeg conversion failed: %s", conv.stderr.decode(errors="replace")[:300])
+            return []
+
+        json_out = os.path.join(tmp, "audio")
         cmd = [
-            "whisper",
-            audio_path,
-            "--model", WHISPER_MODEL,
-            "--language", "ru",
-            "--output_format", "json",
-            "--output_dir", tmp,
+            "whisper-cli",
+            "-m", WHISPER_CPP_MODEL,
+            "-l", "ru",
+            "-f", wav_path,
+            "-oj",
+            "-of", json_out,
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=3600)
-        json_files = list(Path(tmp).glob("*.json"))
-        if not json_files:
-            log.error("Whisper produced no output. stderr: %s", result.stderr.decode(errors="replace"))
+        json_file = Path(json_out + ".json")
+        if not json_file.exists():
+            log.error("whisper-cpp produced no output. stderr: %s", result.stderr.decode(errors="replace")[:300])
             return []
-        with open(json_files[0]) as f:
+        with open(json_file) as f:
             data = json.load(f)
-    return data.get("segments", [])
+    # whisper-cpp JSON uses "transcription" key with "offsets" for timestamps.
+    raw = data.get("transcription", [])
+    segments = []
+    for item in raw:
+        offsets = item.get("offsets", {})
+        segments.append({
+            "start": offsets.get("from", 0) / 1000.0,
+            "end": offsets.get("to", 0) / 1000.0,
+            "text": item.get("text", ""),
+        })
+    return segments
 
 
 def format_timestamp(seconds: float) -> str:
