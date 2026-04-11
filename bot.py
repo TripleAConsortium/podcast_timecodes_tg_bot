@@ -36,11 +36,11 @@ deepseek = OpenAI(
 )
 
 
-async def bot_api_reply(chat_id: int, reply_to_message_id: int, text: str) -> bool:
-    """Send a reply via Bot API instead of userbot."""
+async def bot_api_reply(chat_id: int, reply_to_message_id: int, text: str) -> int | None:
+    """Send a reply via Bot API. Returns message_id on success, None on failure."""
     if not BOT_TOKEN:
         log.warning("BOT_TOKEN not set, cannot send via Bot API")
-        return False
+        return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -50,9 +50,10 @@ async def bot_api_reply(chat_id: int, reply_to_message_id: int, text: str) -> bo
     async with httpx.AsyncClient() as http:
         resp = await http.post(url, json=payload)
         if resp.status_code == 200:
-            return True
+            data = resp.json()
+            return data.get("result", {}).get("message_id")
         log.error(f"Bot API error: {resp.status_code} {resp.text}")
-        return False
+        return None
 
 
 async def bot_api_edit(chat_id: int, message_id: int, text: str) -> bool:
@@ -161,9 +162,7 @@ async def process_audio(client, message, status_message=None, use_bot=False):
     # For bot mode, send initial status via Bot API.
     bot_status_id = None
     if use_bot and BOT_TOKEN and not status_message:
-        if await bot_api_reply(chat_id, msg_id, "Скачиваю аудио..."):
-            # Get the message id from the last bot message (approximate).
-            bot_status_id = None  # We'll just send a new message with the result.
+        bot_status_id = await bot_api_reply(chat_id, msg_id, "Скачиваю аудио...")
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
@@ -173,6 +172,8 @@ async def process_audio(client, message, status_message=None, use_bot=False):
 
         if status_message:
             await status_message.edit_text("Транскрибирую...")
+        elif bot_status_id:
+            await bot_api_edit(chat_id, bot_status_id, "Транскрибирую...")
 
         log.info("Transcribing...")
         loop = asyncio.get_event_loop()
@@ -181,6 +182,9 @@ async def process_audio(client, message, status_message=None, use_bot=False):
             text = "Не удалось распознать речь."
             if status_message:
                 await status_message.edit_text(text)
+            elif bot_status_id:
+                if not await bot_api_edit(chat_id, bot_status_id, text):
+                    await message.reply_text(text)
             elif use_bot and BOT_TOKEN:
                 if not await bot_api_reply(chat_id, msg_id, text):
                     await message.reply_text(text)
@@ -193,6 +197,8 @@ async def process_audio(client, message, status_message=None, use_bot=False):
 
         if status_message:
             await status_message.edit_text("Генерирую таймкоды...")
+        elif bot_status_id:
+            await bot_api_edit(chat_id, bot_status_id, "Генерирую таймкоды...")
 
         log.info("Generating timecodes...")
         timecodes = generate_timecodes(transcript)
@@ -204,6 +210,9 @@ async def process_audio(client, message, status_message=None, use_bot=False):
 
         if status_message:
             await status_message.edit_text(reply_text)
+        elif bot_status_id:
+            if not await bot_api_edit(chat_id, bot_status_id, reply_text):
+                await message.reply_text(reply_text)
         elif use_bot and BOT_TOKEN:
             if not await bot_api_reply(chat_id, msg_id, reply_text):
                 await message.reply_text(reply_text)
@@ -215,6 +224,9 @@ async def process_audio(client, message, status_message=None, use_bot=False):
         text = f"Ошибка: {e}"
         if status_message:
             await status_message.edit_text(text)
+        elif bot_status_id:
+            if not await bot_api_edit(chat_id, bot_status_id, text):
+                await message.reply_text(text)
         elif use_bot and BOT_TOKEN:
             if not await bot_api_reply(chat_id, msg_id, text):
                 await message.reply_text(text)
