@@ -406,12 +406,16 @@ async def handle_caption_trigger(event):
         if len(caption) > 1024:
             caption = caption[:1020] + "\n..."
 
-        try:
-            await client.edit_message(target, caption)
-            log.info("Caption added to original message")
-        except Exception as edit_err:
-            log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with timecodes")
+        if not target.out and target.chat_id != CHAT_ID:
             await target.reply(caption)
+            log.info("Posted timecodes as reply (not own message)")
+        else:
+            try:
+                await client.edit_message(target, caption)
+                log.info("Caption added to original message")
+            except Exception as edit_err:
+                log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with timecodes")
+                await target.reply(caption)
 
     except Exception as e:
         log.error(f"Error: {e}")
