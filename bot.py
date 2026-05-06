@@ -295,8 +295,12 @@ async def process_audio_as_caption(message):
         if len(caption) > 1024:
             caption = caption[:1020] + "\n..."
 
-        await message.edit(caption)
-        log.info("Caption added to own message")
+        try:
+            await client.edit_message(message, caption)
+            log.info("Caption added to own message")
+        except Exception as edit_err:
+            log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with timecodes")
+            await message.reply(caption)
 
     except Exception as e:
         log.error(f"Error: {e}")
@@ -402,8 +406,12 @@ async def handle_caption_trigger(event):
         if len(caption) > 1024:
             caption = caption[:1020] + "\n..."
 
-        await target.edit(caption)
-        log.info("Caption added to original message")
+        try:
+            await client.edit_message(target, caption)
+            log.info("Caption added to original message")
+        except Exception as edit_err:
+            log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with timecodes")
+            await target.reply(caption)
 
     except Exception as e:
         log.error(f"Error: {e}")
