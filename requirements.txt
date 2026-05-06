@@ -1,4 +1,4 @@
-kurigram
-tgcrypto
+telethon
+cryptg
 python-dotenv
 openai
