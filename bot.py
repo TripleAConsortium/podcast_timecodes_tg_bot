@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from telethon import TelegramClient, events
 from openai import OpenAI
 
 load_dotenv()
@@ -25,9 +25,8 @@ TRIGGER_COMMAND = os.getenv("TRIGGER_COMMAND", "/timecodes")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-app = Client("podcast_bot", api_id=API_ID, api_hash=API_HASH)
+client = TelegramClient("podcast_bot", API_ID, API_HASH)
 
-chat_filter = filters.chat(CHAT_ID) if CHAT_ID else filters.all
 processed_ids: set[int] = set()
 
 deepseek = OpenAI(
@@ -161,26 +160,26 @@ def has_audio(message) -> bool:
     if message.voice or message.audio:
         return True
     if message.document:
-        mime = message.document.mime_type or ""
-        name = (message.document.file_name or "").lower()
+        mime = (message.file.mime_type if message.file else "") or ""
+        name = ((message.file.name if message.file else "") or "").lower()
         if mime.startswith("audio/") or name.endswith((".m4a", ".mp3", ".ogg", ".opus", ".wav", ".flac", ".aac")):
             return True
     return False
 
 
-async def process_audio(client, message, status_message=None, use_bot=False):
+async def process_audio(message, status_message=None, use_bot=False):
     """Download, transcribe, and generate timecodes for an audio message."""
     suffix = ".ogg"
-    if message.document:
-        name = (message.document.file_name or "").lower()
+    if message.audio:
+        suffix = ".mp3"
+    elif message.document:
+        name = ((message.file.name if message.file else "") or "").lower()
         if name.endswith(".m4a"):
             suffix = ".m4a"
         elif name.endswith(".mp3"):
             suffix = ".mp3"
-    elif message.audio:
-        suffix = ".mp3"
 
-    chat_id = message.chat.id
+    chat_id = message.chat_id
     msg_id = message.id
 
     # For bot mode, send initial status via Bot API.
@@ -191,11 +190,11 @@ async def process_audio(client, message, status_message=None, use_bot=False):
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        await message.download(file_name=tmp_path)
+        await message.download_media(file=tmp_path)
         log.info(f"Downloaded to {tmp_path}")
 
         if status_message:
-            await status_message.edit_text("Транскрибирую...")
+            await status_message.edit("Транскрибирую...")
         elif bot_status_id:
             await bot_api_edit(chat_id, bot_status_id, "Транскрибирую...")
 
@@ -205,22 +204,22 @@ async def process_audio(client, message, status_message=None, use_bot=False):
         if not segments:
             text = "Не удалось распознать речь."
             if status_message:
-                await status_message.edit_text(text)
+                await status_message.edit(text)
             elif bot_status_id:
                 if not await bot_api_edit(chat_id, bot_status_id, text):
-                    await message.reply_text(text)
+                    await message.reply(text)
             elif use_bot and BOT_TOKEN:
                 if not await bot_api_reply(chat_id, msg_id, text):
-                    await message.reply_text(text)
+                    await message.reply(text)
             else:
-                await message.reply_text(text)
+                await message.reply(text)
             return
 
         transcript = build_transcript_with_times(segments)
         log.info(f"Transcribed {len(segments)} segments")
 
         if status_message:
-            await status_message.edit_text("Генерирую таймкоды...")
+            await status_message.edit("Генерирую таймкоды...")
         elif bot_status_id:
             await bot_api_edit(chat_id, bot_status_id, "Генерирую таймкоды...")
 
@@ -233,56 +232,56 @@ async def process_audio(client, message, status_message=None, use_bot=False):
             reply_text = reply_text[:4090] + "\n..."
 
         if status_message:
-            await status_message.edit_text(reply_text)
+            await status_message.edit(reply_text)
         elif bot_status_id:
             if not await bot_api_edit(chat_id, bot_status_id, reply_text):
-                await message.reply_text(reply_text)
+                await message.reply(reply_text)
         elif use_bot and BOT_TOKEN:
             if not await bot_api_reply(chat_id, msg_id, reply_text):
-                await message.reply_text(reply_text)
+                await message.reply(reply_text)
         else:
-            await message.reply_text(reply_text)
+            await message.reply(reply_text)
 
     except Exception as e:
         log.error(f"Error: {e}")
         text = f"Ошибка: {e}"
         if status_message:
-            await status_message.edit_text(text)
+            await status_message.edit(text)
         elif bot_status_id:
             if not await bot_api_edit(chat_id, bot_status_id, text):
-                await message.reply_text(text)
+                await message.reply(text)
         elif use_bot and BOT_TOKEN:
             if not await bot_api_reply(chat_id, msg_id, text):
-                await message.reply_text(text)
+                await message.reply(text)
         else:
-            await message.reply_text(text)
+            await message.reply(text)
     finally:
         os.unlink(tmp_path)
 
 
-async def process_audio_as_caption(client, message):
+async def process_audio_as_caption(message):
     """Download, transcribe, generate timecodes and set as caption on the original message."""
     suffix = ".ogg"
-    if message.document:
-        name = (message.document.file_name or "").lower()
+    if message.audio:
+        suffix = ".mp3"
+    elif message.document:
+        name = ((message.file.name if message.file else "") or "").lower()
         if name.endswith(".m4a"):
             suffix = ".m4a"
         elif name.endswith(".mp3"):
             suffix = ".mp3"
-    elif message.audio:
-        suffix = ".mp3"
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        await message.download(file_name=tmp_path)
+        await message.download_media(file=tmp_path)
         log.info(f"Downloaded to {tmp_path}")
 
         log.info("Transcribing...")
         loop = asyncio.get_event_loop()
         segments = await loop.run_in_executor(None, transcribe, tmp_path)
         if not segments:
-            await message.reply_text("Не удалось распознать речь.")
+            await message.reply("Не удалось распознать речь.")
             return
 
         transcript = build_transcript_with_times(segments)
@@ -296,75 +295,90 @@ async def process_audio_as_caption(client, message):
         if len(caption) > 1024:
             caption = caption[:1020] + "\n..."
 
-        await message.edit_caption(caption)
+        await message.edit(caption)
         log.info("Caption added to own message")
 
     except Exception as e:
         log.error(f"Error: {e}")
-        await message.reply_text(f"Ошибка: {e}")
+        await message.reply(f"Ошибка: {e}")
     finally:
         os.unlink(tmp_path)
 
 
-@app.on_message(chat_filter & (filters.voice | filters.audio | (filters.document & filters.create(lambda _, __, m: has_audio(m)))))
-async def handle_new_audio(client, message):
+@client.on(events.NewMessage(
+    chats=CHAT_ID if CHAT_ID else None,
+    func=lambda e: has_audio(e.message),
+))
+async def handle_new_audio(event):
     """Auto-process new audio messages."""
+    message = event.message
     if message.id in processed_ids:
         log.info(f"Skipping already processed message {message.id}")
         return
     processed_ids.add(message.id)
-    log.info(f"Received audio from {message.from_user.first_name} in {message.chat.id}")
 
-    is_own = message.from_user and message.from_user.is_self
-    if is_own:
-        await process_audio_as_caption(client, message)
+    sender = await message.get_sender()
+    sender_name = getattr(sender, "first_name", None) or "Unknown"
+    log.info(f"Received audio from {sender_name} in {message.chat_id}")
+
+    if message.out:
+        await process_audio_as_caption(message)
     else:
-        await process_audio(client, message, use_bot=bool(BOT_TOKEN))
+        await process_audio(message, use_bot=bool(BOT_TOKEN))
 
 
-@app.on_message(filters.reply & filters.regex(f"^{TRIGGER_COMMAND}$"))
-async def handle_reply_trigger(client, message):
+@client.on(events.NewMessage(pattern=f"^{TRIGGER_COMMAND}$"))
+async def handle_reply_trigger(event):
     """Process old audio when someone replies with /timecodes."""
-    target = message.reply_to_message
+    message = event.message
+    if not message.is_reply:
+        return
+    target = await message.get_reply_message()
     if not target or not has_audio(target):
-        await message.reply_text("Ответьте этой командой на голосовое или аудио сообщение.")
+        await message.reply("Ответьте этой командой на голосовое или аудио сообщение.")
         return
 
-    log.info(f"Manual trigger from {message.from_user.first_name} for message {target.id}")
+    sender = await message.get_sender()
+    sender_name = getattr(sender, "first_name", None) or "Unknown"
+    log.info(f"Manual trigger from {sender_name} for message {target.id}")
 
     # Edit the trigger message into a status, then replace with result.
-    status = await message.edit_text("Скачиваю аудио...")
-    await process_audio(client, target, status_message=status)
+    status = await message.edit("Скачиваю аудио...")
+    await process_audio(target, status_message=status)
 
 
 CAPTION_COMMAND = os.getenv("CAPTION_COMMAND", "/tc")
 
 
-@app.on_message(filters.reply & filters.regex(f"^{CAPTION_COMMAND}$"))
-async def handle_caption_trigger(client, message):
+@client.on(events.NewMessage(pattern=f"^{CAPTION_COMMAND}$"))
+async def handle_caption_trigger(event):
     """Process audio and attach timecodes as caption to the original message."""
-    target = message.reply_to_message
+    message = event.message
+    if not message.is_reply:
+        return
+    target = await message.get_reply_message()
     if not target or not has_audio(target):
-        await message.reply_text("Ответьте этой командой на голосовое или аудио сообщение.")
+        await message.reply("Ответьте этой командой на голосовое или аудио сообщение.")
         return
 
-    sender = message.from_user.first_name if message.from_user else "Unknown"
-    log.info(f"Caption trigger from {sender} for message {target.id}")
+    sender = await message.get_sender()
+    sender_name = getattr(sender, "first_name", None) or "Unknown"
+    log.info(f"Caption trigger from {sender_name} for message {target.id}")
 
     suffix = ".ogg"
-    if target.document:
-        name = (target.document.file_name or "").lower()
+    if target.audio:
+        suffix = ".mp3"
+    elif target.document:
+        name = ((target.file.name if target.file else "") or "").lower()
         if name.endswith(".m4a"):
             suffix = ".m4a"
         elif name.endswith(".mp3"):
             suffix = ".mp3"
-    elif target.audio:
-        suffix = ".mp3"
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        await target.download(file_name=tmp_path)
+        await target.download_media(file=tmp_path)
         log.info(f"Downloaded to {tmp_path}")
 
         # Delete command message.
@@ -374,7 +388,7 @@ async def handle_caption_trigger(client, message):
         loop = asyncio.get_event_loop()
         segments = await loop.run_in_executor(None, transcribe, tmp_path)
         if not segments:
-            await target.reply_text("Не удалось распознать речь.")
+            await target.reply("Не удалось распознать речь.")
             return
 
         transcript = build_transcript_with_times(segments)
@@ -388,16 +402,17 @@ async def handle_caption_trigger(client, message):
         if len(caption) > 1024:
             caption = caption[:1020] + "\n..."
 
-        await target.edit_caption(caption)
+        await target.edit(caption)
         log.info("Caption added to original message")
 
     except Exception as e:
         log.error(f"Error: {e}")
-        await target.reply_text(f"Ошибка: {e}")
+        await target.reply(f"Ошибка: {e}")
     finally:
         os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
     log.info("Starting podcast bot...")
-    app.run()
+    client.start()
+    client.run_until_disconnected()
