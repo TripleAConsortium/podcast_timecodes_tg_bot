@@ -2,6 +2,7 @@
 import asyncio
 import os
 import json
+import shlex
 import tempfile
 import subprocess
 import logging
@@ -24,6 +25,8 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 TRIGGER_COMMAND = os.getenv("TRIGGER_COMMAND", "/timecodes")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+USE_LOCAL_CLAUDE = os.getenv("USE_LOCAL_CLAUDE", "0") == "1"
+LOCAL_CLAUDE_CMD = os.getenv("LOCAL_CLAUDE_CMD", "claude -p --model sonnet")
 
 client = TelegramClient("podcast_bot", API_ID, API_HASH)
 
@@ -137,7 +140,7 @@ def build_transcript_with_times(segments: list[dict]) -> str:
 
 
 def generate_timecodes(transcript: str) -> str:
-    """Ask DeepSeek to split transcript into topics with timecodes."""
+    """Split transcript into topics with timecodes via DeepSeek API or local claude CLI."""
     prompt = (
         "Ниже — транскрипт подкаста с таймкодами.\n"
         "Раздели его на смысловые темы. Для каждой темы укажи таймкод начала и краткое название.\n"
@@ -147,12 +150,30 @@ def generate_timecodes(transcript: str) -> str:
         "...\n\n"
         f"Транскрипт:\n{transcript}"
     )
+    if USE_LOCAL_CLAUDE:
+        return run_local_claude(prompt)
     response = deepseek.chat.completions.create(
         model="deepseek-reasoner",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
     )
     return response.choices[0].message.content.strip()
+
+
+def run_local_claude(prompt: str) -> str:
+    """Pipe the prompt into a local CLI (default: `claude -p --model sonnet`) and return stdout."""
+    cmd = shlex.split(LOCAL_CLAUDE_CMD)
+    log.info("Running local LLM: %s", " ".join(cmd))
+    result = subprocess.run(
+        cmd,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=1500,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"local LLM failed (rc={result.returncode}): {result.stderr[:300]}")
+    return result.stdout.strip()
 
 
 def has_audio(message) -> bool:
