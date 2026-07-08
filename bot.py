@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import os
+import re
 import json
 import shlex
 import tempfile
@@ -27,6 +28,15 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 USE_LOCAL_CLAUDE = os.getenv("USE_LOCAL_CLAUDE", "0") == "1"
 LOCAL_CLAUDE_CMD = os.getenv("LOCAL_CLAUDE_CMD", "claude -p --model sonnet")
+ASK_COMMAND = os.getenv("ASK_COMMAND", "/ask")
+# Long audio: split the transcript into time windows and summarize each, then
+# merge — a single LLM call over a 1-2h transcript tends to cover only the start.
+CHUNK_MINUTES = int(os.getenv("CHUNK_MINUTES", "30"))
+# Only chunk when the audio is longer than this (minutes); shorter → single call.
+CHUNK_THRESHOLD_MIN = int(os.getenv("CHUNK_THRESHOLD_MIN", "45"))
+# Telegram hard limits.
+TG_MSG_LIMIT = 4096
+TG_CAPTION_LIMIT = 1024
 
 client = TelegramClient("podcast_bot", API_ID, API_HASH)
 
@@ -139,17 +149,36 @@ def build_transcript_with_times(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def generate_timecodes(transcript: str) -> str:
-    """Split transcript into topics with timecodes via DeepSeek API or local claude CLI."""
-    prompt = (
-        "Ниже — транскрипт подкаста с таймкодами.\n"
-        "Раздели его на смысловые темы. Для каждой темы укажи таймкод начала и краткое название.\n"
-        "Формат ответа — только список таймкодов, без лишнего текста:\n"
-        "00:00 — Название темы\n"
-        "05:30 — Другая тема\n"
-        "...\n\n"
-        f"Транскрипт:\n{transcript}"
-    )
+def generate_timecodes(transcript: str, part_context: tuple | None = None) -> str:
+    """Split a transcript into topic timecodes via DeepSeek API or local claude CLI.
+
+    part_context = (index, total, start_ts, end_ts) marks this transcript as one
+    time-window of a longer episode, so the model covers only this part and keeps
+    the absolute timestamps it was given instead of resetting to zero.
+    """
+    if part_context:
+        idx, total, start_ts, end_ts = part_context
+        prompt = (
+            f"Ниже — ЧАСТЬ {idx} из {total} транскрипта одного подкаста "
+            f"(интервал {start_ts}–{end_ts}) с таймкодами.\n"
+            "Раздели ЭТУ часть на смысловые темы. Таймкоды бери как есть — они "
+            "абсолютные, от начала всего подкаста, не сбрасывай на ноль.\n"
+            "Ответ — ТОЛЬКО список таймкодов этой части, без вступлений и итогов:\n"
+            "00:00 — Название темы\n"
+            "05:30 — Другая тема\n"
+            "...\n\n"
+            f"Транскрипт части:\n{transcript}"
+        )
+    else:
+        prompt = (
+            "Ниже — транскрипт подкаста с таймкодами.\n"
+            "Раздели его на смысловые темы. Для каждой темы укажи таймкод начала и краткое название.\n"
+            "Формат ответа — только список таймкодов, без лишнего текста:\n"
+            "00:00 — Название темы\n"
+            "05:30 — Другая тема\n"
+            "...\n\n"
+            f"Транскрипт:\n{transcript}"
+        )
     if USE_LOCAL_CLAUDE:
         return run_local_claude(prompt)
     response = deepseek.chat.completions.create(
@@ -174,6 +203,104 @@ def run_local_claude(prompt: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"local LLM failed (rc={result.returncode}): {result.stderr[:300]}")
     return result.stdout.strip()
+
+
+def _partition_segments(segments: list[dict], window_seconds: float) -> list[list[dict]]:
+    """Split segments into consecutive time windows of ~window_seconds each."""
+    chunks: list[list[dict]] = []
+    cur: list[dict] = []
+    window_start = segments[0]["start"] if segments else 0.0
+    for seg in segments:
+        if cur and seg["start"] - window_start >= window_seconds:
+            chunks.append(cur)
+            cur = []
+            window_start = seg["start"]
+        cur.append(seg)
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _last_timecode_seconds(text: str) -> float:
+    """Parse the latest mm:ss / h:mm:ss timestamp present in a timecode list."""
+    last = 0.0
+    for m in re.finditer(r"(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)", text):
+        h_or_m, mm, ss = m.group(1), m.group(2), m.group(3)
+        secs = int(h_or_m) * 3600 + int(mm) * 60 + int(ss) if ss is not None else int(h_or_m) * 60 + int(mm)
+        last = max(last, secs)
+    return last
+
+
+def generate_timecodes_for_segments(segments: list[dict]) -> str:
+    """Generate timecodes for a whole episode, chunking long audio by time windows.
+
+    whisper transcribes the full file, but a single LLM call over a 1-2h transcript
+    tends to cover only the beginning, so long episodes are split into CHUNK_MINUTES
+    windows, each summarized independently, and the results merged.
+    """
+    if not segments:
+        return ""
+    duration = segments[-1]["end"]
+    log.info("Transcript covers %s (%.1f min)", format_timestamp(duration), duration / 60)
+    if duration <= CHUNK_THRESHOLD_MIN * 60:
+        result = generate_timecodes(build_transcript_with_times(segments))
+    else:
+        windows = _partition_segments(segments, CHUNK_MINUTES * 60)
+        log.info("Long audio → %d windows of ~%d min", len(windows), CHUNK_MINUTES)
+        parts = []
+        for i, win in enumerate(windows, 1):
+            start_ts = format_timestamp(win[0]["start"])
+            end_ts = format_timestamp(win[-1]["end"])
+            log.info("  window %d/%d %s–%s (%d segments)", i, len(windows), start_ts, end_ts, len(win))
+            out = generate_timecodes(
+                build_transcript_with_times(win),
+                part_context=(i, len(windows), start_ts, end_ts),
+            ).strip()
+            if out:
+                parts.append(out)
+        result = "\n".join(parts)
+    covered = _last_timecode_seconds(result)
+    if duration - covered > 600:
+        log.warning(
+            "Timecodes may be incomplete: last %s vs audio end %s",
+            format_timestamp(covered), format_timestamp(duration),
+        )
+    return result
+
+
+def split_for_telegram(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
+    """Split text into <=limit-char pieces at line boundaries (hard-split long lines)."""
+    parts: list[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        if not cur:
+            cur = line
+        elif len(cur) + 1 + len(line) <= limit:
+            cur += "\n" + line
+        else:
+            parts.append(cur)
+            cur = line
+    if cur:
+        parts.append(cur)
+    return parts or [""]
+
+
+async def send_timecodes_as_replies(target, body: str, use_bot: bool = False):
+    """Reply to `target` with `body`, split across multiple messages when too long."""
+    parts = split_for_telegram(body, TG_MSG_LIMIT)
+    for part in parts:
+        sent = False
+        if use_bot and BOT_TOKEN:
+            sent = bool(await bot_api_reply(target.chat_id, target.id, part))
+        if not sent:
+            await target.reply(part)
+    log.info("Posted timecodes as %d message(s)", len(parts))
 
 
 def has_audio(message) -> bool:
@@ -236,7 +363,6 @@ async def process_audio(message, status_message=None, use_bot=False):
                 await message.reply(text)
             return
 
-        transcript = build_transcript_with_times(segments)
         log.info(f"Transcribed {len(segments)} segments")
 
         if status_message:
@@ -245,23 +371,30 @@ async def process_audio(message, status_message=None, use_bot=False):
             await bot_api_edit(chat_id, bot_status_id, "Генерирую таймкоды...")
 
         log.info("Generating timecodes...")
-        timecodes = generate_timecodes(transcript)
+        timecodes = generate_timecodes_for_segments(segments)
         log.info("Timecodes generated")
 
-        reply_text = f"{timecodes}\n\n#подкаст"
-        if len(reply_text) > 4096:
-            reply_text = reply_text[:4090] + "\n..."
+        body = f"{timecodes}\n\n#подкаст"
+        parts = split_for_telegram(body, TG_MSG_LIMIT)
+        first, rest = parts[0], parts[1:]
 
+        # First part reuses the status message / expected reply slot.
         if status_message:
-            await status_message.edit(reply_text)
+            await status_message.edit(first)
         elif bot_status_id:
-            if not await bot_api_edit(chat_id, bot_status_id, reply_text):
-                await message.reply(reply_text)
+            if not await bot_api_edit(chat_id, bot_status_id, first):
+                await message.reply(first)
         elif use_bot and BOT_TOKEN:
-            if not await bot_api_reply(chat_id, msg_id, reply_text):
-                await message.reply(reply_text)
+            if not await bot_api_reply(chat_id, msg_id, first):
+                await message.reply(first)
         else:
-            await message.reply(reply_text)
+            await message.reply(first)
+
+        # Any remaining parts go as follow-up replies to the audio.
+        for part in rest:
+            if use_bot and BOT_TOKEN and await bot_api_reply(chat_id, msg_id, part):
+                continue
+            await message.reply(part)
 
     except Exception as e:
         log.error(f"Error: {e}")
@@ -305,23 +438,23 @@ async def process_audio_as_caption(message):
             await message.reply("Не удалось распознать речь.")
             return
 
-        transcript = build_transcript_with_times(segments)
         log.info(f"Transcribed {len(segments)} segments")
 
         log.info("Generating timecodes...")
-        timecodes = generate_timecodes(transcript)
+        timecodes = generate_timecodes_for_segments(segments)
         log.info("Timecodes generated")
 
-        caption = f"{timecodes}\n\n#подкаст"
-        if len(caption) > 1024:
-            caption = caption[:1020] + "\n..."
-
-        try:
-            await client.edit_message(message, caption)
-            log.info("Caption added to own message")
-        except Exception as edit_err:
-            log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with timecodes")
-            await message.reply(caption)
+        body = f"{timecodes}\n\n#подкаст"
+        if len(body) <= TG_CAPTION_LIMIT:
+            try:
+                await client.edit_message(message, body)
+                log.info("Caption added to own message")
+            except Exception as edit_err:
+                log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with timecodes")
+                await send_timecodes_as_replies(message, body)
+        else:
+            # Too long for a caption → post as a reply chain instead.
+            await send_timecodes_as_replies(message, body)
 
     except Exception as e:
         log.error(f"Error: {e}")
@@ -416,35 +549,100 @@ async def handle_caption_trigger(event):
             await target.reply("Не удалось распознать речь.")
             return
 
-        transcript = build_transcript_with_times(segments)
         log.info(f"Transcribed {len(segments)} segments")
 
         log.info("Generating timecodes...")
-        timecodes = generate_timecodes(transcript)
+        timecodes = generate_timecodes_for_segments(segments)
         log.info("Timecodes generated")
 
-        caption = f"{timecodes}\n\n#подкаст"
-        if len(caption) > 1024:
-            caption = caption[:1020] + "\n..."
+        body = f"{timecodes}\n\n#подкаст"
+        use_bot = (not target.out) and target.chat_id == CHAT_ID
 
-        if target.out:
+        if target.out and len(body) <= TG_CAPTION_LIMIT:
             try:
-                await client.edit_message(target, caption)
+                await client.edit_message(target, body)
                 log.info("Caption added to original message")
             except Exception as edit_err:
                 log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with timecodes")
-                await target.reply(caption)
-        elif target.chat_id == CHAT_ID and BOT_TOKEN and await bot_api_reply(target.chat_id, target.id, caption):
-            log.info("Posted timecodes via Bot API (CHAT_ID, foreign message)")
+                await send_timecodes_as_replies(target, body, use_bot=use_bot)
         else:
-            await target.reply(caption)
-            log.info("Posted timecodes as userbot reply")
+            # Foreign message, or too long for a caption → reply (chain if needed).
+            await send_timecodes_as_replies(target, body, use_bot=use_bot)
 
     except Exception as e:
         log.error(f"Error: {e}")
         await target.reply(f"Ошибка: {e}")
     finally:
         os.unlink(tmp_path)
+
+
+def is_ask_command(event) -> bool:
+    text = event.message.message or ""
+    if not text.startswith(ASK_COMMAND):
+        return False
+    tail = text[len(ASK_COMMAND):]
+    return tail == "" or tail[0].isspace()
+
+
+@client.on(events.NewMessage(func=is_ask_command))
+async def handle_ask_command(event):
+    """Run the command text as a prompt through the local CLI, with the replied
+    message attached as context. Result is sent via Bot API as a reply to the
+    command message."""
+    message = event.message
+    if not message.is_reply:
+        await message.reply("Ответьте этой командой на сообщение.")
+        return
+
+    target = await message.get_reply_message()
+    if not target:
+        await message.reply("Не могу прочитать сообщение, на которое отвечено.")
+        return
+
+    sender = await message.get_sender()
+    sender_name = getattr(sender, "first_name", None) or "Unknown"
+
+    raw_text = message.message or ""
+    user_prompt = raw_text[len(ASK_COMMAND):].strip()
+    target_text = (target.message or "").strip()
+
+    log.info(f"Ask from {sender_name} reply→{target.id}, prompt={user_prompt[:80]!r}")
+
+    if not user_prompt and not target_text:
+        await message.reply("Пустой prompt и пустое сообщение.")
+        return
+
+    parts = [p for p in (user_prompt, target_text) if p]
+    full_prompt = "\n\n".join(parts)
+
+    chat_id = message.chat_id
+    bot_status_id = None
+    if BOT_TOKEN:
+        bot_status_id = await bot_api_reply(chat_id, message.id, "Думаю...")
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, run_local_claude, full_prompt)
+    except Exception as e:
+        log.error(f"Ask error: {e}")
+        text = f"Ошибка: {e}"
+        if bot_status_id:
+            if not await bot_api_edit(chat_id, bot_status_id, text):
+                await message.reply(text)
+        else:
+            await message.reply(text)
+        return
+
+    if not result:
+        result = "(пустой ответ)"
+    if len(result) > 4096:
+        result = result[:4090] + "\n..."
+
+    if bot_status_id:
+        if not await bot_api_edit(chat_id, bot_status_id, result):
+            await message.reply(result)
+    else:
+        await message.reply(result)
 
 
 if __name__ == "__main__":
