@@ -149,12 +149,13 @@ def build_transcript_with_times(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def generate_timecodes(transcript: str, part_context: tuple | None = None) -> str:
+def generate_timecodes(transcript: str, part_context: tuple | None = None, backend: str | None = None) -> str:
     """Split a transcript into topic timecodes via DeepSeek API or local claude CLI.
 
     part_context = (index, total, start_ts, end_ts) marks this transcript as one
     time-window of a longer episode, so the model covers only this part and keeps
     the absolute timestamps it was given instead of resetting to zero.
+    backend = "claude" | "deepseek" overrides the USE_LOCAL_CLAUDE default for this call.
     """
     if part_context:
         idx, total, start_ts, end_ts = part_context
@@ -179,7 +180,8 @@ def generate_timecodes(transcript: str, part_context: tuple | None = None) -> st
             "...\n\n"
             f"Транскрипт:\n{transcript}"
         )
-    if USE_LOCAL_CLAUDE:
+    use_claude = USE_LOCAL_CLAUDE if backend is None else backend == "claude"
+    if use_claude:
         return run_local_claude(prompt)
     response = deepseek.chat.completions.create(
         model="deepseek-reasoner",
@@ -231,19 +233,21 @@ def _last_timecode_seconds(text: str) -> float:
     return last
 
 
-def generate_timecodes_for_segments(segments: list[dict]) -> str:
+def generate_timecodes_for_segments(segments: list[dict], backend: str | None = None) -> str:
     """Generate timecodes for a whole episode, chunking long audio by time windows.
 
     whisper transcribes the full file, but a single LLM call over a 1-2h transcript
     tends to cover only the beginning, so long episodes are split into CHUNK_MINUTES
     windows, each summarized independently, and the results merged.
+    backend = "claude" | "deepseek" overrides the USE_LOCAL_CLAUDE default.
     """
     if not segments:
         return ""
     duration = segments[-1]["end"]
-    log.info("Transcript covers %s (%.1f min)", format_timestamp(duration), duration / 60)
+    active = backend or ("claude" if USE_LOCAL_CLAUDE else "deepseek")
+    log.info("Transcript covers %s (%.1f min), backend=%s", format_timestamp(duration), duration / 60, active)
     if duration <= CHUNK_THRESHOLD_MIN * 60:
-        result = generate_timecodes(build_transcript_with_times(segments))
+        result = generate_timecodes(build_transcript_with_times(segments), backend=backend)
     else:
         windows = _partition_segments(segments, CHUNK_MINUTES * 60)
         log.info("Long audio → %d windows of ~%d min", len(windows), CHUNK_MINUTES)
@@ -255,6 +259,7 @@ def generate_timecodes_for_segments(segments: list[dict]) -> str:
             out = generate_timecodes(
                 build_transcript_with_times(win),
                 part_context=(i, len(windows), start_ts, end_ts),
+                backend=backend,
             ).strip()
             if out:
                 parts.append(out)
@@ -303,6 +308,22 @@ async def send_timecodes_as_replies(target, body: str, use_bot: bool = False):
     log.info("Posted timecodes as %d message(s)", len(parts))
 
 
+def parse_backend(arg: str | None):
+    """Map a /tc|/timecodes argument to a backend override.
+
+    Returns (backend, error): backend is "claude"|"deepseek"|None; error is a
+    user-facing message when the arg is present but unrecognized.
+    """
+    if not arg:
+        return None, None
+    a = arg.strip().lower()
+    if a in ("claude", "cl"):
+        return "claude", None
+    if a in ("deepseek", "ds"):
+        return "deepseek", None
+    return None, f"Неизвестная модель «{arg}». Доступно: claude, deepseek."
+
+
 def has_audio(message) -> bool:
     """Check if message has voice, audio, or document with audio mime."""
     if message.voice or message.audio:
@@ -315,7 +336,7 @@ def has_audio(message) -> bool:
     return False
 
 
-async def process_audio(message, status_message=None, use_bot=False):
+async def process_audio(message, status_message=None, use_bot=False, backend=None):
     """Download, transcribe, and generate timecodes for an audio message."""
     suffix = ".ogg"
     if message.audio:
@@ -371,7 +392,7 @@ async def process_audio(message, status_message=None, use_bot=False):
             await bot_api_edit(chat_id, bot_status_id, "Генерирую таймкоды...")
 
         log.info("Generating timecodes...")
-        timecodes = generate_timecodes_for_segments(segments)
+        timecodes = generate_timecodes_for_segments(segments, backend=backend)
         log.info("Timecodes generated")
 
         body = f"{timecodes}\n\n#подкаст"
@@ -485,11 +506,15 @@ async def handle_new_audio(event):
         await process_audio(message, use_bot=bool(BOT_TOKEN))
 
 
-@client.on(events.NewMessage(pattern=f"^{TRIGGER_COMMAND}$"))
+@client.on(events.NewMessage(pattern=rf"(?i)^{re.escape(TRIGGER_COMMAND)}(?:\s+(\S+))?\s*$"))
 async def handle_reply_trigger(event):
-    """Process old audio when someone replies with /timecodes."""
+    """Process old audio on reply with /timecodes [claude|deepseek]."""
     message = event.message
     if not message.is_reply:
+        return
+    backend, err = parse_backend(event.pattern_match.group(1))
+    if err:
+        await message.reply(err)
         return
     target = await message.get_reply_message()
     if not target or not has_audio(target):
@@ -498,21 +523,25 @@ async def handle_reply_trigger(event):
 
     sender = await message.get_sender()
     sender_name = getattr(sender, "first_name", None) or "Unknown"
-    log.info(f"Manual trigger from {sender_name} for message {target.id}")
+    log.info(f"Manual trigger from {sender_name} for message {target.id} (backend={backend or 'default'})")
 
     # Edit the trigger message into a status, then replace with result.
     status = await message.edit("Скачиваю аудио...")
-    await process_audio(target, status_message=status)
+    await process_audio(target, status_message=status, backend=backend)
 
 
 CAPTION_COMMAND = os.getenv("CAPTION_COMMAND", "/tc")
 
 
-@client.on(events.NewMessage(pattern=f"^{CAPTION_COMMAND}$"))
+@client.on(events.NewMessage(pattern=rf"(?i)^{re.escape(CAPTION_COMMAND)}(?:\s+(\S+))?\s*$"))
 async def handle_caption_trigger(event):
-    """Process audio and attach timecodes as caption to the original message."""
+    """Attach timecodes as caption; /tc [claude|deepseek] picks the model."""
     message = event.message
     if not message.is_reply:
+        return
+    backend, err = parse_backend(event.pattern_match.group(1))
+    if err:
+        await message.reply(err)
         return
     target = await message.get_reply_message()
     if not target or not has_audio(target):
@@ -521,7 +550,7 @@ async def handle_caption_trigger(event):
 
     sender = await message.get_sender()
     sender_name = getattr(sender, "first_name", None) or "Unknown"
-    log.info(f"Caption trigger from {sender_name} for message {target.id}")
+    log.info(f"Caption trigger from {sender_name} for message {target.id} (backend={backend or 'default'})")
 
     suffix = ".ogg"
     if target.audio:
@@ -552,7 +581,7 @@ async def handle_caption_trigger(event):
         log.info(f"Transcribed {len(segments)} segments")
 
         log.info("Generating timecodes...")
-        timecodes = generate_timecodes_for_segments(segments)
+        timecodes = generate_timecodes_for_segments(segments, backend=backend)
         log.info("Timecodes generated")
 
         body = f"{timecodes}\n\n#подкаст"
