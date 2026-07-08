@@ -34,9 +34,13 @@ ASK_COMMAND = os.getenv("ASK_COMMAND", "/ask")
 CHUNK_MINUTES = int(os.getenv("CHUNK_MINUTES", "30"))
 # Only chunk when the audio is longer than this (minutes); shorter → single call.
 CHUNK_THRESHOLD_MIN = int(os.getenv("CHUNK_THRESHOLD_MIN", "45"))
-# Telegram hard limits.
+# Cap topics per window so a long episode's merged list stays readable and reliably
+# fits a caption (DeepSeek otherwise over-segments to ~70-90 topics, ~3-4k chars).
+MAX_TOPICS_PER_WINDOW = int(os.getenv("MAX_TOPICS_PER_WINDOW", "12"))
+# Telegram caption max is 1024 chars, or 4096 with Telegram Premium; an over-limit
+# caption edit is rejected by Telegram and the handler falls back to a reply.
 TG_MSG_LIMIT = 4096
-TG_CAPTION_LIMIT = 1024
+TG_CAPTION_LIMIT = int(os.getenv("TG_CAPTION_LIMIT", "4096"))
 
 client = TelegramClient("podcast_bot", API_ID, API_HASH)
 
@@ -162,8 +166,9 @@ def generate_timecodes(transcript: str, part_context: tuple | None = None, backe
         prompt = (
             f"Ниже — ЧАСТЬ {idx} из {total} транскрипта одного подкаста "
             f"(интервал {start_ts}–{end_ts}) с таймкодами.\n"
-            "Раздели ЭТУ часть на смысловые темы. Таймкоды бери как есть — они "
-            "абсолютные, от начала всего подкаста, не сбрасывай на ноль.\n"
+            f"Выдели не более {MAX_TOPICS_PER_WINDOW} КРУПНЫХ смысловых тем этой части — "
+            "только заметные переходы, мелкие смежные объединяй. Таймкоды бери как есть — "
+            "они абсолютные, от начала всего подкаста, не сбрасывай на ноль.\n"
             "Ответ — ТОЛЬКО список таймкодов этой части, без вступлений и итогов:\n"
             "00:00 — Название темы\n"
             "05:30 — Другая тема\n"
@@ -586,6 +591,7 @@ async def handle_caption_trigger(event):
 
         body = f"{timecodes}\n\n#подкаст"
         use_bot = (not target.out) and target.chat_id == CHAT_ID
+        log.info("Timecodes body: %d chars (caption limit %d)", len(body), TG_CAPTION_LIMIT)
 
         if target.out and len(body) <= TG_CAPTION_LIMIT:
             try:
