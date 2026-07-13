@@ -28,7 +28,6 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 USE_LOCAL_CLAUDE = os.getenv("USE_LOCAL_CLAUDE", "0") == "1"
 LOCAL_CLAUDE_CMD = os.getenv("LOCAL_CLAUDE_CMD", "claude -p --model sonnet")
-ASK_COMMAND = os.getenv("ASK_COMMAND", "/ask")
 # Long audio: split the transcript into time windows and summarize each, then
 # merge — a single LLM call over a 1-2h transcript tends to cover only the start.
 CHUNK_MINUTES = int(os.getenv("CHUNK_MINUTES", "30"))
@@ -511,10 +510,21 @@ async def handle_new_audio(event):
         await process_audio(message, use_bot=bool(BOT_TOKEN))
 
 
+def in_allowed_chat(message) -> bool:
+    """Only act in the podcast chat (CHAT_ID) or on our own messages. Commands
+    must never fire in other chats — commenting on a channel post auto-joins the
+    account to that channel's discussion group, so a membership check would pass
+    there; an explicit allowlist is the only reliable guard. Elsewhere we return
+    silently and send nothing (a reply would itself be a send into that chat)."""
+    return message.chat_id == CHAT_ID or message.out
+
+
 @client.on(events.NewMessage(pattern=rf"(?i)^{re.escape(TRIGGER_COMMAND)}(?:\s+(\S+))?\s*$"))
 async def handle_reply_trigger(event):
     """Process old audio on reply with /timecodes [claude|deepseek]."""
     message = event.message
+    if not in_allowed_chat(message):
+        return
     if not message.is_reply:
         return
     backend, err = parse_backend(event.pattern_match.group(1))
@@ -542,6 +552,8 @@ CAPTION_COMMAND = os.getenv("CAPTION_COMMAND", "/tc")
 async def handle_caption_trigger(event):
     """Attach timecodes as caption; /tc [claude|deepseek] picks the model."""
     message = event.message
+    if not in_allowed_chat(message):
+        return
     if not message.is_reply:
         return
     backend, err = parse_backend(event.pattern_match.group(1))
@@ -609,75 +621,6 @@ async def handle_caption_trigger(event):
         await target.reply(f"Ошибка: {e}")
     finally:
         os.unlink(tmp_path)
-
-
-def is_ask_command(event) -> bool:
-    text = event.message.message or ""
-    if not text.startswith(ASK_COMMAND):
-        return False
-    tail = text[len(ASK_COMMAND):]
-    return tail == "" or tail[0].isspace()
-
-
-@client.on(events.NewMessage(func=is_ask_command))
-async def handle_ask_command(event):
-    """Run the command text as a prompt through the local CLI, with the replied
-    message attached as context. Result is sent via Bot API as a reply to the
-    command message."""
-    message = event.message
-    if not message.is_reply:
-        await message.reply("Ответьте этой командой на сообщение.")
-        return
-
-    target = await message.get_reply_message()
-    if not target:
-        await message.reply("Не могу прочитать сообщение, на которое отвечено.")
-        return
-
-    sender = await message.get_sender()
-    sender_name = getattr(sender, "first_name", None) or "Unknown"
-
-    raw_text = message.message or ""
-    user_prompt = raw_text[len(ASK_COMMAND):].strip()
-    target_text = (target.message or "").strip()
-
-    log.info(f"Ask from {sender_name} reply→{target.id}, prompt={user_prompt[:80]!r}")
-
-    if not user_prompt and not target_text:
-        await message.reply("Пустой prompt и пустое сообщение.")
-        return
-
-    parts = [p for p in (user_prompt, target_text) if p]
-    full_prompt = "\n\n".join(parts)
-
-    chat_id = message.chat_id
-    bot_status_id = None
-    if BOT_TOKEN:
-        bot_status_id = await bot_api_reply(chat_id, message.id, "Думаю...")
-
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, run_local_claude, full_prompt)
-    except Exception as e:
-        log.error(f"Ask error: {e}")
-        text = f"Ошибка: {e}"
-        if bot_status_id:
-            if not await bot_api_edit(chat_id, bot_status_id, text):
-                await message.reply(text)
-        else:
-            await message.reply(text)
-        return
-
-    if not result:
-        result = "(пустой ответ)"
-    if len(result) > 4096:
-        result = result[:4090] + "\n..."
-
-    if bot_status_id:
-        if not await bot_api_edit(chat_id, bot_status_id, result):
-            await message.reply(result)
-    else:
-        await message.reply(result)
 
 
 if __name__ == "__main__":
