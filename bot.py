@@ -277,6 +277,61 @@ def generate_timecodes_for_segments(segments: list[dict], backend: str | None = 
     return result
 
 
+def build_plain_transcript(segments: list[dict]) -> str:
+    """Join segment texts into one continuous string (no timestamps)."""
+    return " ".join(seg["text"].strip() for seg in segments if seg["text"].strip())
+
+
+def clean_transcript(text: str, backend: str | None = None) -> str:
+    """Run raw ASR text through the LLM to fix proper-noun spelling, punctuation
+    and paragraph breaks, WITHOUT changing wording or meaning (not a summary).
+    backend = "claude" | "deepseek" overrides the USE_LOCAL_CLAUDE default.
+    """
+    prompt = (
+        "Ниже — сырой текст автоматической расшифровки речи: без знаков препинания, "
+        "с возможными ошибками в именах собственных и названиях.\n"
+        "Приведи его в читаемый вид, СТРОГО сохранив слова и смысл говорящего:\n"
+        "— исправь написание имён собственных, названий и терминов;\n"
+        "— расставь знаки препинания и заглавные буквы;\n"
+        "— раздели на абзацы по смыслу, где это уместно;\n"
+        "— НЕ пересказывай, НЕ сокращай, НЕ добавляй ничего от себя и не выбрасывай реплики.\n"
+        "В ответе — ТОЛЬКО очищенный текст, без вступлений, заголовков и комментариев.\n\n"
+        f"Текст:\n{text}"
+    )
+    use_claude = USE_LOCAL_CLAUDE if backend is None else backend == "claude"
+    if use_claude:
+        return run_local_claude(prompt)
+    response = deepseek.chat.completions.create(
+        model="deepseek-reasoner",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def clean_transcript_for_segments(segments: list[dict], backend: str | None = None) -> str:
+    """Clean a whole episode's transcript, chunking long audio by time windows so a
+    single LLM call doesn't drop the tail (same failure mode as the timecodes path).
+    backend = "claude" | "deepseek" overrides the USE_LOCAL_CLAUDE default.
+    """
+    if not segments:
+        return ""
+    duration = segments[-1]["end"]
+    active = backend or ("claude" if USE_LOCAL_CLAUDE else "deepseek")
+    log.info("Cleaning transcript: %s (%.1f min), backend=%s", format_timestamp(duration), duration / 60, active)
+    if duration <= CHUNK_THRESHOLD_MIN * 60:
+        return clean_transcript(build_plain_transcript(segments), backend=backend)
+    windows = _partition_segments(segments, CHUNK_MINUTES * 60)
+    log.info("Long audio → %d windows of ~%d min for cleaning", len(windows), CHUNK_MINUTES)
+    parts = []
+    for i, win in enumerate(windows, 1):
+        log.info("  cleaning window %d/%d (%d segments)", i, len(windows), len(win))
+        out = clean_transcript(build_plain_transcript(win), backend=backend).strip()
+        if out:
+            parts.append(out)
+    return "\n\n".join(parts)
+
+
 def split_for_telegram(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
     """Split text into <=limit-char pieces at line boundaries (hard-split long lines)."""
     parts: list[str] = []
@@ -611,6 +666,89 @@ async def handle_caption_trigger(event):
                 log.info("Caption added to original message")
             except Exception as edit_err:
                 log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with timecodes")
+                await send_timecodes_as_replies(target, body, use_bot=use_bot)
+        else:
+            # Foreign message, or too long for a caption → reply (chain if needed).
+            await send_timecodes_as_replies(target, body, use_bot=use_bot)
+
+    except Exception as e:
+        log.error(f"Error: {e}")
+        await target.reply(f"Ошибка: {e}")
+    finally:
+        os.unlink(tmp_path)
+
+
+TRANSCRIPT_COMMAND = os.getenv("TRANSCRIPT_COMMAND", "/tra")
+
+
+@client.on(events.NewMessage(pattern=rf"(?i)^{re.escape(TRANSCRIPT_COMMAND)}(?:\s+(\S+))?\s*$"))
+async def handle_transcript_trigger(event):
+    """Attach the cleaned-up transcript (not timecodes) as caption.
+    /tra [claude|deepseek] picks the model that fixes names, punctuation, paragraphs."""
+    message = event.message
+    if not in_allowed_chat(message):
+        return
+    if not message.is_reply:
+        return
+    backend, err = parse_backend(event.pattern_match.group(1))
+    if err:
+        await message.reply(err)
+        return
+    target = await message.get_reply_message()
+    if not target or not has_audio(target):
+        await message.reply("Ответьте этой командой на голосовое или аудио сообщение.")
+        return
+
+    sender = await message.get_sender()
+    sender_name = getattr(sender, "first_name", None) or "Unknown"
+    log.info(f"Transcript trigger from {sender_name} for message {target.id} (backend={backend or 'default'})")
+
+    suffix = ".ogg"
+    if target.audio:
+        suffix = ".mp3"
+    elif target.document:
+        name = ((target.file.name if target.file else "") or "").lower()
+        if name.endswith(".m4a"):
+            suffix = ".m4a"
+        elif name.endswith(".mp3"):
+            suffix = ".mp3"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        await target.download_media(file=tmp_path)
+        log.info(f"Downloaded to {tmp_path}")
+
+        # Delete command message.
+        await message.delete()
+
+        log.info("Transcribing...")
+        loop = asyncio.get_event_loop()
+        segments = await loop.run_in_executor(None, transcribe, tmp_path)
+        if not segments:
+            await target.reply("Не удалось распознать речь.")
+            return
+
+        log.info(f"Transcribed {len(segments)} segments")
+
+        log.info("Cleaning transcript...")
+        cleaned = clean_transcript_for_segments(segments, backend=backend)
+        log.info("Transcript cleaned")
+
+        if not cleaned.strip():
+            await target.reply("Пустой результат очистки.")
+            return
+
+        body = cleaned
+        use_bot = (not target.out) and target.chat_id == CHAT_ID
+        log.info("Transcript body: %d chars (caption limit %d)", len(body), TG_CAPTION_LIMIT)
+
+        if target.out and len(body) <= TG_CAPTION_LIMIT:
+            try:
+                await client.edit_message(target, body)
+                log.info("Caption added to original message")
+            except Exception as edit_err:
+                log.warning(f"Caption edit failed ({type(edit_err).__name__}: {edit_err}); replying with transcript")
                 await send_timecodes_as_replies(target, body, use_bot=use_bot)
         else:
             # Foreign message, or too long for a caption → reply (chain if needed).
