@@ -22,6 +22,8 @@ log = logging.getLogger(__name__)
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+# deepseek-reasoner/-chat were retired; the API now takes deepseek-v4-pro or -v4-flash.
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 TRIGGER_COMMAND = os.getenv("TRIGGER_COMMAND", "/timecodes")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
@@ -188,7 +190,7 @@ def generate_timecodes(transcript: str, part_context: tuple | None = None, backe
     if use_claude:
         return run_local_claude(prompt)
     response = deepseek.chat.completions.create(
-        model="deepseek-reasoner",
+        model=DEEPSEEK_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
     )
@@ -302,7 +304,7 @@ def clean_transcript(text: str, backend: str | None = None) -> str:
     if use_claude:
         return run_local_claude(prompt)
     response = deepseek.chat.completions.create(
-        model="deepseek-reasoner",
+        model=DEEPSEEK_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
     )
